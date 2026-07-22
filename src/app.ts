@@ -26,6 +26,49 @@ app.get("/api/healthz", (_req: Request, res: Response) => {
   res.json(HealthCheckResponse.parse({ status: "ok" }));
 });
 
+// ── Debug: diagnose search config & Roblox connectivity ──────────────────
+app.get("/api/debug/search", async (_req: Request, res: Response) => {
+  const cookie = process.env.ROBLOX_COOKIE;
+
+  const cookieStatus = !cookie
+    ? "NOT SET"
+    : cookie.length < 20
+    ? "SET BUT TOO SHORT (possibly wrong value)"
+    : `SET (${cookie.length} chars, starts: ${cookie.slice(0, 6)}...)`;
+
+  // Test the actual Roblox endpoint with the cookie
+  let robloxStatus: number | string = "not tested";
+  let robloxBody = "";
+  if (cookie) {
+    try {
+      const resp = await fetch(
+        "https://apis.roblox.com/toolbox-service/v1/search?category=Models&keyword=tree&limit=5&sort=Relevance",
+        {
+          headers: {
+            Accept: "application/json",
+            Cookie: `.ROBLOSECURITY=${cookie}`,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+        }
+      );
+      robloxStatus = resp.status;
+      const txt = await resp.text();
+      robloxBody = txt.slice(0, 300);
+    } catch (e) {
+      robloxStatus = "FETCH ERROR";
+      robloxBody = String(e);
+    }
+  }
+
+  res.json({
+    cookieEnvVar: cookieStatus,
+    robloxEndpoint: "apis.roblox.com/toolbox-service/v1/search",
+    robloxHttpStatus: robloxStatus,
+    robloxResponsePreview: robloxBody,
+    note: "200 = working | 401 = cookie invalid/expired | 403 = blocked | 404 = wrong URL",
+  });
+});
+
 // ── Engine: load asset ────────────────────────────────────────────────────
 /**
  * POST /api/engine/load
@@ -140,3 +183,4 @@ app.get("/api/engine/search", async (req: Request, res: Response): Promise<void>
 });
 
 export default app;
+
