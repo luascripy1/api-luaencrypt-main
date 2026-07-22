@@ -1,28 +1,29 @@
 /**
  * Roblox Asset Search
  *
- * Queries the Roblox Catalog API for Model assets (category 6),
- * then batch-fetches thumbnails from the Thumbnails API.
- * All endpoints are public — no authentication required.
+ * Queries the Roblox Toolbox Service API — the SAME API that Roblox Studio's
+ * built-in Toolbox panel uses for the "Models" tab. Results are environment
+ * models (trees, buildings, props, etc.), NOT avatar accessories/costumes.
+ *
+ * Bug yang diperbaiki:
+ *   ❌ Sebelumnya pakai catalog.roblox.com dengan Category=6 (Gear/avatar)
+ *   ✅ Sekarang pakai apis.roblox.com/toolbox-service/v1/search?category=Models
+ *
+ * Thumbnail sudah ter-include dalam response toolbox-service,
+ * tidak perlu fetch terpisah ke thumbnails.roblox.com.
  */
 
-const CATALOG_SEARCH_URL = "https://catalog.roblox.com/v1/search/items/details";
-const THUMBNAILS_URL = "https://thumbnails.roblox.com/v1/assets";
+// Endpoint resmi Roblox Studio Toolbox (bukan Avatar Catalog)
+const TOOLBOX_SEARCH_URL =
+  "https://apis.roblox.com/toolbox-service/v1/search";
 
-// Maps user-friendly sort names to Roblox sortType numbers
-const SORT_TYPE: Record<string, number> = {
-  Relevance: 0,
-  MostFavorited: 5,
-  RecentlyUpdated: 4,
-  Bestseller: 1,
+// Maps user-friendly sort names to Roblox toolbox sort values
+const SORT_TYPE: Record<string, string> = {
+  Relevance: "Relevance",
+  MostFavorited: "MostFavorited",
+  RecentlyUpdated: "RecentlyUpdated",
+  Bestseller: "Bestseller",
 };
-
-/** Round user-requested limit to the nearest valid Roblox catalog page size (10, 28, 30) */
-function toValidLimit(requested: number): 10 | 28 | 30 {
-  if (requested <= 10) return 10;
-  if (requested <= 28) return 28;
-  return 30;
-}
 
 export interface AssetSearchOptions {
   keyword: string;
@@ -55,67 +56,40 @@ export interface AssetSearchResult {
 
 export class AssetSearchError extends Error {}
 
-// ── Internal Roblox API types ─────────────────────────────────────────────
+// ── Internal Roblox Toolbox API types ────────────────────────────────────
 
-interface RobloxCatalogItem {
+interface ToolboxAsset {
   id: number;
   name: string;
   description?: string;
-  creatorName?: string;
-  creatorType?: string;
-  creatorTargetId?: number;
-  favoriteCount?: number;
+  typeId?: number;
+  assetType?: { id: number; name: string };
+  creator?: {
+    id: number;
+    name: string;
+    type: number; // 1 = User, 2 = Group
+  };
+  stats?: {
+    favoriteCount?: number;
+  };
 }
 
-interface RobloxCatalogResponse {
-  keyword?: string;
-  data: RobloxCatalogItem[];
+interface ToolboxThumbnail {
+  final: boolean;
+  url?: string;
+  retry?: boolean;
+}
+
+interface ToolboxResult {
+  asset: ToolboxAsset;
+  thumbnail?: ToolboxThumbnail;
+}
+
+interface ToolboxSearchResponse {
+  results: ToolboxResult[];
   nextPageCursor?: string | null;
   previousPageCursor?: string | null;
   totalResults?: number;
-}
-
-interface RobloxThumbnailEntry {
-  targetId: number;
-  state: string;
-  imageUrl?: string;
-}
-
-interface RobloxThumbnailResponse {
-  data: RobloxThumbnailEntry[];
-}
-
-// ── Thumbnail batch fetch ─────────────────────────────────────────────────
-
-async function fetchThumbnails(
-  assetIds: number[],
-): Promise<Record<number, string>> {
-  if (assetIds.length === 0) return {};
-
-  const params = new URLSearchParams({
-    assetIds: assetIds.join(","),
-    format: "Png",
-    size: "150x150",
-  });
-
-  let response: Response;
-  try {
-    response = await fetch(`${THUMBNAILS_URL}?${params}`);
-  } catch {
-    // Thumbnail failures are non-fatal — we just return empty map
-    return {};
-  }
-
-  if (!response.ok) return {};
-
-  const json = (await response.json()) as RobloxThumbnailResponse;
-  const map: Record<number, string> = {};
-  for (const entry of json.data ?? []) {
-    if (entry.state === "Completed" && entry.imageUrl) {
-      map[entry.targetId] = entry.imageUrl;
-    }
-  }
-  return map;
 }
 
 // ── Main search function ──────────────────────────────────────────────────
@@ -131,23 +105,23 @@ export async function searchAssets(
     creatorName,
   } = options;
 
-  const pageSize = toValidLimit(limit ?? 10);
-  const sortType = SORT_TYPE[sort] ?? 0;
+  const clampedLimit = Math.min(Math.max(1, limit), 30);
+  const sortValue = SORT_TYPE[sort] ?? "Relevance";
 
-  // Roblox Catalog API v1 uses PascalCase for Category/Keyword
+  // Roblox Toolbox Service API — category=Models menghasilkan 3D environment
+  // models (pohon, bangunan, prop), BUKAN avatar accessories/kostum
   const params = new URLSearchParams({
-    Category: "6", // 6 = Models/Gear category
-    Keyword: keyword,
-    limit: String(pageSize),
-    sortType: String(sortType),
-    sortAggregation: "5",
+    category: "Models",      // ← Toolbox "Models" tab
+    keyword: keyword,
+    limit: String(clampedLimit),
+    sort: sortValue,
   });
   if (cursor) params.set("cursor", cursor);
   if (creatorName) params.set("creatorName", creatorName);
 
   let response: Response;
   try {
-    response = await fetch(`${CATALOG_SEARCH_URL}?${params}`, {
+    response = await fetch(`${TOOLBOX_SEARCH_URL}?${params}`, {
       headers: {
         Accept: "application/json",
         "User-Agent":
@@ -157,7 +131,7 @@ export async function searchAssets(
     });
   } catch {
     throw new AssetSearchError(
-      "Could not reach Roblox Catalog API. Check your internet connection.",
+      "Could not reach Roblox Toolbox API. Check your internet connection.",
     );
   }
 
@@ -169,35 +143,43 @@ export async function searchAssets(
 
   if (!response.ok) {
     throw new AssetSearchError(
-      `Roblox Catalog API returned HTTP ${response.status}.`,
+      `Roblox Toolbox API returned HTTP ${response.status}.`,
     );
   }
 
-  const catalog = (await response.json()) as RobloxCatalogResponse;
-  const items: RobloxCatalogItem[] = catalog.data ?? [];
+  const data = (await response.json()) as ToolboxSearchResponse;
+  const results: ToolboxResult[] = data.results ?? [];
 
-  // Batch-fetch thumbnails for all result IDs
-  const ids = items.map((item) => item.id);
-  const thumbnails = await fetchThumbnails(ids);
+  const assets: AssetSearchItem[] = results.map((entry) => {
+    const asset = entry.asset;
+    const thumbnail = entry.thumbnail;
 
-  const assets: AssetSearchItem[] = items.map((item) => ({
-    id: String(item.id),
-    name: item.name ?? "Unknown",
-    description: item.description ?? "",
-    creator: {
-      name: item.creatorName ?? "Unknown",
-      type: item.creatorType ?? "User",
-      id: item.creatorTargetId ?? 0,
-    },
-    favoriteCount: item.favoriteCount ?? 0,
-    thumbnail: thumbnails[item.id] ?? null,
-  }));
+    // Toolbox service type: 1 = User, 2 = Group
+    const creatorTypeName =
+      asset.creator?.type === 2 ? "Group" : "User";
+
+    return {
+      id: String(asset.id),
+      name: asset.name ?? "Unknown",
+      description: asset.description ?? "",
+      creator: {
+        name: asset.creator?.name ?? "Unknown",
+        type: creatorTypeName,
+        id: asset.creator?.id ?? 0,
+      },
+      favoriteCount: asset.stats?.favoriteCount ?? 0,
+      // Thumbnail sudah ada di response, tidak perlu fetch terpisah
+      thumbnail:
+        thumbnail?.final && thumbnail.url ? thumbnail.url : null,
+    };
+  });
 
   return {
     keyword,
     assets,
-    nextCursor: catalog.nextPageCursor ?? null,
-    previousCursor: catalog.previousPageCursor ?? null,
-    total: catalog.totalResults ?? assets.length,
+    nextCursor: data.nextPageCursor ?? null,
+    previousCursor: data.previousPageCursor ?? null,
+    total: data.totalResults ?? assets.length,
   };
 }
+
