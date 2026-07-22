@@ -195,4 +195,3 @@ export async function searchAssets(
     total: data.totalResults ?? assets.length,
   };
 }
-
