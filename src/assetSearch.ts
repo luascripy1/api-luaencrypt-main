@@ -1,23 +1,22 @@
 /**
  * Roblox Asset Search
  *
- * Queries the Roblox Toolbox Service API — the SAME API that Roblox Studio's
- * built-in Toolbox panel uses for the "Models" tab. Results are environment
- * models (trees, buildings, props, etc.), NOT avatar accessories/costumes.
+ * Menggunakan Roblox Toolbox Service API — API yang sama persis dengan
+ * yang dipakai Roblox Studio tab "Models". Menghasilkan 3D environment
+ * models (pohon, bangunan, prop), BUKAN avatar kostum/aksesori.
  *
- * Bug yang diperbaiki:
- *   ❌ Sebelumnya pakai catalog.roblox.com dengan Category=6 (Gear/avatar)
- *   ✅ Sekarang pakai apis.roblox.com/toolbox-service/v1/search?category=Models
+ * Endpoint: apis.roblox.com/toolbox-service/v1/search?category=Models
+ * Auth: .ROBLOSECURITY cookie (sama seperti asset delivery)
  *
- * Thumbnail sudah ter-include dalam response toolbox-service,
- * tidak perlu fetch terpisah ke thumbnails.roblox.com.
+ * Penyebab error 502 sebelumnya:
+ *   ❌ catalog.roblox.com + Category=6 → Avatar Gear (salah API + salah category)
+ *   ❌ toolbox-service tanpa cookie → HTTP 401 → engine lempar 502
+ *   ✅ toolbox-service + ROBLOX_COOKIE → HTTP 200 → Models yang benar
  */
 
-// Endpoint resmi Roblox Studio Toolbox (bukan Avatar Catalog)
 const TOOLBOX_SEARCH_URL =
   "https://apis.roblox.com/toolbox-service/v1/search";
 
-// Maps user-friendly sort names to Roblox toolbox sort values
 const SORT_TYPE: Record<string, string> = {
   Relevance: "Relevance",
   MostFavorited: "MostFavorited",
@@ -62,8 +61,6 @@ interface ToolboxAsset {
   id: number;
   name: string;
   description?: string;
-  typeId?: number;
-  assetType?: { id: number; name: string };
   creator?: {
     id: number;
     name: string;
@@ -108,10 +105,8 @@ export async function searchAssets(
   const clampedLimit = Math.min(Math.max(1, limit), 30);
   const sortValue = SORT_TYPE[sort] ?? "Relevance";
 
-  // Roblox Toolbox Service API — category=Models menghasilkan 3D environment
-  // models (pohon, bangunan, prop), BUKAN avatar accessories/kostum
   const params = new URLSearchParams({
-    category: "Models",      // ← Toolbox "Models" tab
+    category: "Models",  // Toolbox Models tab — environment models, bukan avatar
     keyword: keyword,
     limit: String(clampedLimit),
     sort: sortValue,
@@ -119,11 +114,23 @@ export async function searchAssets(
   if (cursor) params.set("cursor", cursor);
   if (creatorName) params.set("creatorName", creatorName);
 
+  // Roblox cookie — wajib untuk toolbox-service (sama seperti asset delivery)
+  // Set ROBLOX_COOKIE di Vercel → Project → Settings → Environment Variables
+  const cookie = process.env.ROBLOX_COOKIE;
+  if (!cookie) {
+    throw new AssetSearchError(
+      "ROBLOX_COOKIE belum dikonfigurasi. " +
+      "Set environment variable ROBLOX_COOKIE di Vercel dengan cookie .ROBLOSECURITY kamu. " +
+      "Tanpa cookie, Roblox Toolbox API menolak request dengan 401.",
+    );
+  }
+
   let response: Response;
   try {
     response = await fetch(`${TOOLBOX_SEARCH_URL}?${params}`, {
       headers: {
         Accept: "application/json",
+        Cookie: `.ROBLOSECURITY=${cookie}`,
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
@@ -132,6 +139,13 @@ export async function searchAssets(
   } catch {
     throw new AssetSearchError(
       "Could not reach Roblox Toolbox API. Check your internet connection.",
+    );
+  }
+
+  if (response.status === 401) {
+    throw new AssetSearchError(
+      "Roblox menolak cookie (401) — ROBLOX_COOKIE mungkin sudah expired atau tidak valid. " +
+      "Ambil cookie baru dari browser dan update di Vercel Environment Variables.",
     );
   }
 
@@ -154,7 +168,6 @@ export async function searchAssets(
     const asset = entry.asset;
     const thumbnail = entry.thumbnail;
 
-    // Toolbox service type: 1 = User, 2 = Group
     const creatorTypeName =
       asset.creator?.type === 2 ? "Group" : "User";
 
@@ -168,7 +181,6 @@ export async function searchAssets(
         id: asset.creator?.id ?? 0,
       },
       favoriteCount: asset.stats?.favoriteCount ?? 0,
-      // Thumbnail sudah ada di response, tidak perlu fetch terpisah
       thumbnail:
         thumbnail?.final && thumbnail.url ? thumbnail.url : null,
     };
