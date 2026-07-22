@@ -106,10 +106,11 @@ export async function searchAssets(
   const sortValue = SORT_TYPE[sort] ?? "Relevance";
 
   const params = new URLSearchParams({
-    category: "Models",  // Toolbox Models tab — environment models, bukan avatar
+    category: "Models",                   // plural — sesuai endpoint /v1/search
     keyword: keyword,
     limit: String(clampedLimit),
     sort: sortValue,
+    includeOnlyVerifiedCreators: "false", // tampilkan semua creator
   });
   if (cursor) params.set("cursor", cursor);
   if (creatorName) params.set("creatorName", creatorName);
