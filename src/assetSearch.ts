@@ -1,35 +1,49 @@
 /**
- * Roblox Asset Search
+ * Roblox Asset Search — Toolbox Service API
  *
- * Menggunakan Roblox Toolbox Service API — API yang sama persis dengan
- * yang dipakai Roblox Studio tab "Models". Menghasilkan 3D environment
- * models (pohon, bangunan, prop), BUKAN avatar kostum/aksesori.
+ * Uses the official Roblox Toolbox Service (same API used by Roblox Studio).
+ * Step 1: search for asset IDs via  /toolbox-service/v1/marketplace/{assetType}
+ * Step 2: batch-fetch full details via /toolbox-service/v1/items/details
  *
- * Endpoint: apis.roblox.com/toolbox-service/v1/search?category=Models
- * Auth: .ROBLOSECURITY cookie (sama seperti asset delivery)
- *
- * Penyebab error 502 sebelumnya:
- *   ❌ catalog.roblox.com + Category=6 → Avatar Gear (salah API + salah category)
- *   ❌ toolbox-service tanpa cookie → HTTP 401 → engine lempar 502
- *   ✅ toolbox-service + ROBLOX_COOKIE → HTTP 200 → Models yang benar
+ * No authentication required for public/free assets.
  */
 
-const TOOLBOX_SEARCH_URL =
-  "https://apis.roblox.com/toolbox-service/v1/search";
+const TOOLBOX_SEARCH_BASE = "https://apis.roblox.com/toolbox-service/v1/marketplace";
+const TOOLBOX_DETAILS_URL = "https://apis.roblox.com/toolbox-service/v1/items/details";
 
-const SORT_TYPE: Record<string, string> = {
-  Relevance: "Relevance",
-  MostFavorited: "MostFavorited",
-  RecentlyUpdated: "RecentlyUpdated",
-  Bestseller: "Bestseller",
+export const VALID_SORTS = [
+  "Relevance",
+  "MostFavorited",
+  "RecentlyCreated",
+  "Updated",
+  "AllTime",
+] as const;
+export type SortOption = (typeof VALID_SORTS)[number];
+
+export const VALID_ASSET_TYPES = [
+  "Model",
+  "Decal",
+  "Audio",
+  "Plugin",
+  "MeshPart",
+] as const;
+export type AssetTypeOption = (typeof VALID_ASSET_TYPES)[number];
+
+function toValidLimit(n: number): 10 | 28 {
+  return n <= 10 ? 10 : 28;
+}
+
+const HEADERS = {
+  Accept: "application/json",
+  "User-Agent": "RobloxStudio/WinInet",
 };
 
 export interface AssetSearchOptions {
   keyword: string;
   limit?: number;
   cursor?: string;
-  sort?: keyof typeof SORT_TYPE;
-  creatorName?: string;
+  sort?: SortOption;
+  assetType?: AssetTypeOption;
 }
 
 export interface AssetSearchItem {
@@ -38,160 +52,167 @@ export interface AssetSearchItem {
   description: string;
   creator: {
     name: string;
-    type: string;
+    type: "User" | "Group";
     id: number;
+    isVerified: boolean;
   };
-  favoriteCount: number;
-  thumbnail: string | null;
+  upVotes: number;
+  downVotes: number;
+  hasScripts: boolean;
+  thumbnail: null;
 }
 
 export interface AssetSearchResult {
   keyword: string;
+  assetType: AssetTypeOption;
   assets: AssetSearchItem[];
   nextCursor: string | null;
-  previousCursor: string | null;
+  previousCursor: null;
   total: number;
 }
 
-export class AssetSearchError extends Error {}
-
-// ── Internal Roblox Toolbox API types ────────────────────────────────────
-
-interface ToolboxAsset {
-  id: number;
-  name: string;
-  description?: string;
-  creator?: {
-    id: number;
-    name: string;
-    type: number; // 1 = User, 2 = Group
-  };
-  stats?: {
-    favoriteCount?: number;
-  };
-}
-
-interface ToolboxThumbnail {
-  final: boolean;
-  url?: string;
-  retry?: boolean;
-}
-
-interface ToolboxResult {
-  asset: ToolboxAsset;
-  thumbnail?: ToolboxThumbnail;
+export class AssetSearchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AssetSearchError";
+  }
 }
 
 interface ToolboxSearchResponse {
-  results: ToolboxResult[];
-  nextPageCursor?: string | null;
-  previousPageCursor?: string | null;
+  data: Array<{ id: number; searchResultSource?: string }>;
+  nextPageCursor?: string;
   totalResults?: number;
 }
 
-// ── Main search function ──────────────────────────────────────────────────
+interface ToolboxDetailItem {
+  asset: {
+    id: number;
+    name: string;
+    description?: string;
+    hasScripts?: boolean;
+  };
+  creator: {
+    id: number;
+    name: string;
+    type: number;
+    isVerifiedCreator?: boolean;
+  };
+  voting?: {
+    upVotes?: number;
+    downVotes?: number;
+  };
+}
 
 export async function searchAssets(
   options: AssetSearchOptions,
 ): Promise<AssetSearchResult> {
   const {
     keyword,
-    limit = 24,
+    limit = 10,
     cursor,
     sort = "Relevance",
-    creatorName,
+    assetType = "Model",
   } = options;
 
-  const clampedLimit = Math.min(Math.max(1, limit), 30);
-  const sortValue = SORT_TYPE[sort] ?? "Relevance";
+  const pageSize = toValidLimit(limit);
 
-  const params = new URLSearchParams({
-    category: "Models",                   // plural — sesuai endpoint /v1/search
-    keyword: keyword,
-    limit: String(clampedLimit),
-    sort: sortValue,
-    includeOnlyVerifiedCreators: "false", // tampilkan semua creator
+  const searchParams = new URLSearchParams({
+    keyword,
+    limit: String(pageSize),
+    sort,
   });
-  if (cursor) params.set("cursor", cursor);
-  if (creatorName) params.set("creatorName", creatorName);
+  if (cursor) searchParams.set("cursor", cursor);
 
-  // Roblox cookie — wajib untuk toolbox-service (sama seperti asset delivery)
-  // Set ROBLOX_COOKIE di Vercel → Project → Settings → Environment Variables
-  const cookie = process.env.ROBLOX_COOKIE;
-  if (!cookie) {
-    throw new AssetSearchError(
-      "ROBLOX_COOKIE belum dikonfigurasi. " +
-      "Set environment variable ROBLOX_COOKIE di Vercel dengan cookie .ROBLOSECURITY kamu. " +
-      "Tanpa cookie, Roblox Toolbox API menolak request dengan 401.",
-    );
-  }
-
-  let response: Response;
+  let searchRes: Response;
   try {
-    response = await fetch(`${TOOLBOX_SEARCH_URL}?${params}`, {
-      headers: {
-        Accept: "application/json",
-        Cookie: `.ROBLOSECURITY=${cookie}`,
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
+    searchRes = await fetch(
+      `${TOOLBOX_SEARCH_BASE}/${assetType}?${searchParams}`,
+      { headers: HEADERS },
+    );
   } catch {
     throw new AssetSearchError(
-      "Could not reach Roblox Toolbox API. Check your internet connection.",
+      "Could not reach Roblox Toolbox API.",
     );
   }
 
-  if (response.status === 401) {
+  if (searchRes.status === 429) {
     throw new AssetSearchError(
-      "Roblox menolak cookie (401) — ROBLOX_COOKIE mungkin sudah expired atau tidak valid. " +
-      "Ambil cookie baru dari browser dan update di Vercel Environment Variables.",
+      "Roblox rate-limit — please wait a moment and try again.",
     );
   }
-
-  if (response.status === 429) {
+  if (!searchRes.ok) {
     throw new AssetSearchError(
-      "Roblox rate-limit reached — please wait a moment and try again.",
+      `Roblox Toolbox search returned HTTP ${searchRes.status}.`,
     );
   }
 
-  if (!response.ok) {
-    throw new AssetSearchError(
-      `Roblox Toolbox API returned HTTP ${response.status}.`,
-    );
-  }
+  const searchData = (await searchRes.json()) as ToolboxSearchResponse;
+  const searchItems = searchData.data ?? [];
 
-  const data = (await response.json()) as ToolboxSearchResponse;
-  const results: ToolboxResult[] = data.results ?? [];
-
-  const assets: AssetSearchItem[] = results.map((entry) => {
-    const asset = entry.asset;
-    const thumbnail = entry.thumbnail;
-
-    const creatorTypeName =
-      asset.creator?.type === 2 ? "Group" : "User";
-
+  if (searchItems.length === 0) {
     return {
-      id: String(asset.id),
-      name: asset.name ?? "Unknown",
-      description: asset.description ?? "",
+      keyword, assetType, assets: [],
+      nextCursor: null, previousCursor: null, total: 0,
+    };
+  }
+
+  const idList = searchItems.map((i) => i.id).join(",");
+
+  let detailsRes: Response;
+  try {
+    detailsRes = await fetch(`${TOOLBOX_DETAILS_URL}?assetIds=${idList}`, {
+      headers: HEADERS,
+    });
+  } catch {
+    throw new AssetSearchError("Could not fetch asset details from Roblox.");
+  }
+
+  if (!detailsRes.ok) {
+    throw new AssetSearchError(
+      `Roblox details API returned HTTP ${detailsRes.status}.`,
+    );
+  }
+
+  const detailsData = (await detailsRes.json()) as { data: ToolboxDetailItem[] };
+
+  const detailMap = new Map<number, ToolboxDetailItem>();
+  for (const item of detailsData.data ?? []) {
+    detailMap.set(item.asset.id, item);
+  }
+
+  const assets: AssetSearchItem[] = searchItems.map((si) => {
+    const d = detailMap.get(si.id);
+    if (!d) {
+      return {
+        id: String(si.id),
+        name: "Unknown",
+        description: "",
+        creator: { name: "Unknown", type: "User" as const, id: 0, isVerified: false },
+        upVotes: 0, downVotes: 0, hasScripts: false, thumbnail: null,
+      };
+    }
+    return {
+      id: String(d.asset.id),
+      name: d.asset.name,
+      description: d.asset.description ?? "",
       creator: {
-        name: asset.creator?.name ?? "Unknown",
-        type: creatorTypeName,
-        id: asset.creator?.id ?? 0,
+        name: d.creator.name,
+        type: d.creator.type === 2 ? "Group" : "User",
+        id: d.creator.id,
+        isVerified: d.creator.isVerifiedCreator ?? false,
       },
-      favoriteCount: asset.stats?.favoriteCount ?? 0,
-      thumbnail:
-        thumbnail?.final && thumbnail.url ? thumbnail.url : null,
+      upVotes: d.voting?.upVotes ?? 0,
+      downVotes: d.voting?.downVotes ?? 0,
+      hasScripts: d.asset.hasScripts ?? false,
+      thumbnail: null,
     };
   });
 
   return {
-    keyword,
-    assets,
-    nextCursor: data.nextPageCursor ?? null,
-    previousCursor: data.previousPageCursor ?? null,
-    total: data.totalResults ?? assets.length,
+    keyword, assetType, assets,
+    nextCursor: searchData.nextPageCursor ?? null,
+    previousCursor: null,
+    total: searchData.totalResults ?? assets.length,
   };
 }
+
